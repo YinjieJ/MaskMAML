@@ -20,9 +20,11 @@ class Meta(nn.Module):
         self.task_num = args.task_num
         self.update_step = args.update_step
         self.update_step_test = args.update_step_test
+        self.warm_step = args.warm_step
 
         self.net = Prune()
-        self.meta_optim = optim.Adam(self.net.parameters(), lr=self.meta_lr)
+        self.meta_optim = optim.Adam(self.net.parameters()[:6], lr=self.meta_lr)
+        self.meta_optim2 = optim.Adam(self.net.parameters()[6:], lr=self.meta_lr)
 
     # def clip_grad_by_norm_(self, grad, max_norm):
     #     """
@@ -66,7 +68,7 @@ class Meta(nn.Module):
             i+=1
         return grad
 
-    def forward(self, xs, ys, xq, yq):
+    def forward(self, xs, ys, xq, yq, step):
         task_num, _, _ = xs.size()
         # losses_q = [0 for _ in range(self.update_step + 1)]  # losses_q[i] is the loss on step i
         losses_q = [0, 0]
@@ -78,48 +80,54 @@ class Meta(nn.Module):
             fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, self.net.parameters()[:6])))
             fast_weights.extend(list(self.net.parameters()[6:]))
             for k in range(1, self.update_step):
-                logits = self.net.pretrain(xs[i], vars=fast_weights)
+                logits = self.net.pretrain(xs[i], vars=fast_weights[:6])
                 loss = F.mse_loss(logits, ys[i])
                 grad = torch.autograd.grad(loss, fast_weights[:6])
                 grad = self.clip_grad_by_norm_(grad, 10)
                 fast_weights_t = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights[:6])))
                 fast_weights_t.extend(fast_weights[6:])
                 fast_weights = fast_weights_t
-            for k in range(0, self.update_step):
-                logits = self.net.prune(xs[i], vars=fast_weights)
-                loss = F.mse_loss(logits, ys[i])
-                # print(type(self.net.bim))
-                #loss.backward()
-                grad = torch.autograd.grad(loss, self.net.bim)
-                # grad = torch.autograd.grad(loss, fast_weights[6:])
-                print(grad)
-                grad = self.clip_grad_by_norm_(grad, 10)
-                fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights)))
-            for k in range(0, self.update_step):
-                logits = self.net.prune(xs[i], vars=fast_weights)
-                loss = F.mse_loss(logits, ys[i])
-                grad = torch.autograd.grad(loss, fast_weights)
-                grad = self.clip_grad_by_norm_(grad, 10)
-                grad = self.set_zero_grad(grad, 6, 9)
-                fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights)))
+            if step > self.warm_step:
+                for k in range(0, self.update_step):
+                    logits = self.net.prune(xs[i], vars=fast_weights)
+                    loss = F.mse_loss(logits, ys[i])
+                    #loss.backward()
+                    # grad = torch.autograd.grad(loss, self.net.bim)
+                    grad = torch.autograd.grad(loss, fast_weights[6:])
+                    grad = self.clip_grad_by_norm_(grad, 10)
+                    fast_weights_t = fast_weights[:6]
+                    fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights[6:])))
+                    fast_weights_t.extend(fast_weights)
+                    fast_weights = fast_weights_t
+                for k in range(0, self.update_step):
+                    logits = self.net.prune(xs[i], vars=fast_weights)
+                    loss = F.mse_loss(logits, ys[i])
+                    grad = torch.autograd.grad(loss, fast_weights[:6])
+                    grad = self.clip_grad_by_norm_(grad, 10)
+                    fast_weights_t = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights[:6])))
+                    fast_weights_t.extend(fast_weights[6:])
+                    fast_weights = fast_weights_t
 
             # with no grad
             logits_q = self.net.prune(xq[i], self.net.parameters())
             loss_q = F.mse_loss(logits_q, yq[i])
             losses_q[0] += loss_q
 
-            logits_q = self.net(xq[i], fast_weights)
+            logits_q = self.net.prune(xq[i], fast_weights)
             loss_q = F.mse_loss(logits_q, yq[i])
             losses_q[1] += loss_q
 
         loss_q = losses_q[-1] / task_num
         self.meta_optim.zero_grad()
+        self.meta_optim2.zero_grad()
         loss_q.backward()
         # nn.utils.clip_grad_value_(self.net.vars, clip_value=1)
         # print('meta update')
         # for p in self.net.parameters()[:5]:
         # 	print(torch.norm(p).item())
         self.meta_optim.step()
+        if step > self.warm_step:
+            self.meta_optim2.step()
 
         return losses_q
 
@@ -127,49 +135,53 @@ class Meta(nn.Module):
         losses = [0, 0]
         losses_q = [0, 0]
         net = deepcopy(self.net)
-        logits = self.net.pretrain(xs, vars=None)
+        logits = net.pretrain(xs, vars=None)
         loss = F.mse_loss(logits, ys)
         losses[0] += loss
-        grad = torch.autograd.grad(loss, self.net.parameters())
+        grad = torch.autograd.grad(loss, net.parameters()[:6])
         grad = self.clip_grad_by_norm_(grad, 10)
-        grad = self.set_zero_grad(grad, 6, 9)
-        fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, self.net.parameters())))
-        for k in range(1, self.updata_step):
-            logits = self.net.pretrain(xs, vars=fast_weights)
-            loss = F.mse_loss(logits, ys[i])
-            grad = torch.autograd.grad(loss, fast_weights)
-            grad = self.clip_grad_by_norm_(grad, 10)
-            grad = self.set_zero_grad(grad, 6, 9)
-            fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights)))
-        for k in range(0, self.update_step):
-            logits = self.net.prune(xs, vars=fast_weights)
+        fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, net.parameters()[:6])))
+        fast_weights.extend(list(net.parameters()[6:]))
+        for k in range(1, self.update_step):
+            logits = net.pretrain(xs, vars=fast_weights[:6])
             loss = F.mse_loss(logits, ys)
-            grad = torch.autograd.grad(loss, fast_weights)
+            grad = torch.autograd.grad(loss, fast_weights[:6])
             grad = self.clip_grad_by_norm_(grad, 10)
-            grad = self.set_zero_grad(grad, 0, 6)
-            fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights)))
+            fast_weights_t = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights[:6])))
+            fast_weights_t.extend(fast_weights[6:])
+            fast_weights = fast_weights_t
         for k in range(0, self.update_step):
-            logits = self.net.prune(xs, vars=fast_weights)
+            logits = net.prune(xs, vars=fast_weights)
             loss = F.mse_loss(logits, ys)
-            grad = torch.autograd.grad(loss, fast_weights)
+            # loss.backward()
+            grad = torch.autograd.grad(loss, fast_weights[6:])
             grad = self.clip_grad_by_norm_(grad, 10)
-            grad = self.set_zero_grad(grad, 6, 9)
-            fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights)))
+            fast_weights_t = fast_weights[:6]
+            fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights[6:])))
+            fast_weights_t.extend(fast_weights)
+            fast_weights = fast_weights_t
+        for k in range(0, self.update_step):
+            logits = net.prune(xs, vars=fast_weights)
+            loss = F.mse_loss(logits, ys)
+            grad = torch.autograd.grad(loss, fast_weights[:6])
+            grad = self.clip_grad_by_norm_(grad, 10)
+            fast_weights_t = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights[:6])))
+            fast_weights_t.extend(fast_weights[6:])
+            fast_weights = fast_weights_t
+        losses[1] += loss
 
-            loss[1] += loss
+        logits_q = net.prune(xq, net.parameters())
+        loss_q = F.mse_loss(logits_q, yq)
+        losses_q[0] += loss_q
 
-            logits_q = self.net.prune(xq, self.net.parameters())
-            loss_q = F.mse_loss(logits_q, yq)
-            losses_q[0] += loss_q
-
-            logits_q = self.net(xq, fast_weights)
-            # loss_q will be overwritten and just keep the loss_q on last update step.
-            loss_q = F.mse_loss(logits_q, yq)
-            losses_q[1] += loss_q
+        logits_q = net.prune(xq, fast_weights)
+        # loss_q will be overwritten and just keep the loss_q on last update step.
+        loss_q = F.mse_loss(logits_q, yq)
+        losses_q[1] += loss_q
 
         del net
 
-        return losses, losses_q, logits_q
+        return losses, losses_q, logits_q, fast_weights
 
 
 if __name__ == '__main__':
@@ -182,6 +194,7 @@ if __name__ == '__main__':
     argparser.add_argument('--update_lr', type=float, help='task-level inner update learning rate', default=0.01)
     argparser.add_argument('--update_step', type=int, help='task-level inner update steps', default=1)
     argparser.add_argument('--update_step_test', type=int, help='update steps for finetunning', default=10)
+    argparser.add_argument('--warm_step', type=int, help='warm steps before train masks', default=100)
 
     args = argparser.parse_args()
     maml = Meta(args)

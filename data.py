@@ -2,7 +2,7 @@ import numpy as np
 import random
 
 AMIN = 0.1
-AMAX = 0.5
+AMAX = 5
 PMIN = 0.
 PMAX = np.pi
 XMIN = -5.0

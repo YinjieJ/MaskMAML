@@ -5,9 +5,8 @@ from torch.autograd import Variable
 from torch.nn.modules.utils import _pair
 from torch.nn.parameter import Parameter
 import  numpy as np
+from copy import deepcopy
 
-from reg import Reg
-from mreg import Mreg
 
 # requires_grad=True
 MASK_SCALE = 1e-2
@@ -16,18 +15,25 @@ DEFAULT_THRESHOLD = 5e-3
 class Binarizer(torch.autograd.Function):
     """Binarizes {0, 1} a real valued tensor."""
 
-    def __init__(self, threshold=DEFAULT_THRESHOLD):
-        super(Binarizer, self).__init__()
-        self.threshold = threshold
-
-    def forward(self, inputs):
+    @staticmethod
+    def forward(ctx, inputs, threshold):
         outputs = inputs.clone()
-        outputs[inputs.le(self.threshold)] = 0
-        outputs[inputs.gt(self.threshold)] = 1
+        outputs[inputs.le(threshold)] = 0
+        outputs[inputs.gt(threshold)] = 1
         return outputs
 
-    def backward(self, gradOutput):
-        return gradOutput
+    @staticmethod
+    def backward(ctx, gradOutput):
+        return gradOutput, None
+
+    def __deepcopy__(self, memo):
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            setattr(result, k, deepcopy(v, memo))
+        return result
+
 
 class Prune(nn.Module):
     def __init__(self):
@@ -55,6 +61,7 @@ class Prune(nn.Module):
         mw2 = nn.Parameter(torch.Tensor(40).fill_(MASK_SCALE))
         self.vars.append(mw2)
         self.threshold_fn = Binarizer()
+        self.threshold = DEFAULT_THRESHOLD
 
     def forward(self, *input):
         pass
@@ -88,7 +95,15 @@ class Prune(nn.Module):
         idx = 0
         w, b = vars[idx], vars[idx+1]
         realm = vars[idx//2+6]
-        bim = self.threshold_fn(realm)
+        bim = self.threshold_fn.apply(realm, self.threshold)
+        # bim = bim.repeat(w.shape[0],1)
+        wt = w.mul(bim)
+        x = F.linear(x, wt, b)
+        x = F.leaky_relu(x)
+        idx += 2
+        w, b = vars[idx], vars[idx + 1]
+        realm = vars[idx//2 + 6]
+        bim = self.threshold_fn.apply(realm, self.threshold)
         # bim = bim.repeat(w.shape[0],1)
         wt = w.mul(bim)
         x = F.linear(x, wt, b)
@@ -96,20 +111,12 @@ class Prune(nn.Module):
         idx += 2
         w, b = vars[idx], vars[idx + 1]
         realm = vars[idx // 2 + 6]
-        bim = self.threshold_fn(realm)
-        # bim = bim.repeat(w.shape[0],1)
-        wt = w.mul(bim)
-        x = F.linear(x, wt, b)
-        x = F.leaky_relu(x)
-        idx += 2
-        w, b = vars[idx], vars[idx + 1]
-        realm = vars[idx // 2 + 6]
-        bim = self.threshold_fn(realm)
+        bim = self.threshold_fn.apply(realm, self.threshold)
         # bim = bim.expand(w.shape[0], -1)
         # bim.register_hook(print)
         # bim = bim.reshape(1,-1)
-        self.bim = bim
-        wt = self.bim.mul(w)
+        bim = bim
+        wt = bim.mul(w)
         x = F.linear(x, wt, b)
         idx += 2
 
@@ -117,10 +124,13 @@ class Prune(nn.Module):
 
         return x
 
-    def get_cnum(self, var):
-        c0 = int(sum((self.threshold_fn(var[6]) == 1).int()).cpu().numpy())
-        c1 = int(sum((self.threshold_fn(var[7]) == 1).int()).cpu().numpy())
-        c2 = int(sum((self.threshold_fn(var[8]) == 1).int()).cpu().numpy())
+    def get_cnum(self, vars=None):
+        if vars is None:
+            vars = self.vars
+
+        c0 = int(sum((self.threshold_fn.apply(vars[6], self.threshold) == 1).int()).cpu().numpy())
+        c1 = int(sum((self.threshold_fn.apply(vars[7], self.threshold) == 1).int()).cpu().numpy())
+        c2 = int(sum((self.threshold_fn.apply(vars[8], self.threshold) == 1).int()).cpu().numpy())
 
         return [c0, c1, c2]
 
